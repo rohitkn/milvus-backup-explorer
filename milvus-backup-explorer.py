@@ -24,7 +24,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for coll in catalog.collections():
         segs = catalog.segments(collection_id=coll.collection_id)
         print(f"{coll.qualified_name}  (id={coll.collection_id}, segments={len(segs)})")
-        print(format_collection_summary(coll))
+        print(format_collection_summary(coll, catalog))
         print()
     return 0
 

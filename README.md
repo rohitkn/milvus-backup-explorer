@@ -9,7 +9,7 @@ After running `milvus-backup`, you get a directory (for example `new_backup/`) c
 - **`meta/`** — JSON describing the backup, collections, partitions, segments, and where each binlog file lives.
 - **`binlogs/`** — Binary insert logs (Milvus Storage V2: Parquet files under `binlogs/insert_log/`).
 
-This tool helps you **inspect** what was backed up (`list`) and **decode rows** into JSONL, JSON, CSV, or Parquet (`extract`) without running Milvus or restoring the backup.
+This tool helps you **inspect** what was backed up (`list`) and **decode rows** into JSONL, JSON, CSV, or Parquet (`extract`) without running Milvus. Named partitions created with `create_partition` are restored as subdirectories under each collection in the extract output.
 
 ## Requirements
 
@@ -43,9 +43,10 @@ Binlog files are Parquet (`PAR1`). Columns are tagged with Milvus field IDs in P
 The `list` command **only reads `meta/`**. It does not open `binlogs/`.
 
 1. Loads `backup_meta.json` for backup name and Milvus version.
-2. Loads `collection_meta.json` and builds each collection’s schema (field names, types, primary key, function outputs).
-3. Loads `segment_meta.json` to count segments per collection.
-4. Prints a summary: `database.collection`, collection ID, segment count, and field list.
+2. Loads `collection_meta.json` and builds each collection’s schema (field names, types, primary key, function outputs, partition-key flags).
+3. Loads `partition_meta.json` (and partition entries on each collection) to map partition IDs to names.
+4. Loads `segment_meta.json` to count segments per collection.
+5. Prints a summary: `database.collection`, collection ID, segment count, field list, and any **named partitions** (user-created, not partition-key shards).
 
 Use `list` to see what is in the backup before running a large `extract`.
 
@@ -60,8 +61,9 @@ python milvus-backup-explorer.py list --backup new_backup
 The `extract` command uses **both** `meta/` and `binlogs/`.
 
 1. **Metadata (`meta/`)**  
-   - `collection_meta.json` — maps field IDs to names and types (for decoding vectors, sparse floats, geometry, etc.).  
-   - `segment_meta.json` — for each segment: `num_of_rows` and `log_path` entries pointing at insert binlog files.
+   - `collection_meta.json` — maps field IDs to names and types (for decoding vectors, sparse floats, geometry, etc.), including whether a field is a partition key.  
+   - `partition_meta.json` — maps each `partition_id` to its `partition_name`.  
+   - `segment_meta.json` — for each segment: `partition_id`, `num_of_rows`, and `log_path` entries pointing at insert binlog files.
 
 2. **Path resolution**  
    Metadata paths look like:
@@ -79,10 +81,44 @@ The `extract` command uses **both** `meta/` and `binlogs/`.
    - Sparse float vectors — `{ "index": value, ... }`  
    - Geometry — WKB hex, or WKT with `--geometry-wkt` if shapely is installed  
 
-5. **Writing output**  
-   Files are written under `{output}/{db}/{collection}/segment_{segment_id}.{ext}`.
+5. **Writing output (named partitions restored)**  
+   Default layout (no named partitions, or a partition-key collection):  
+   `{output}/{db}/{collection}/segment_{segment_id}.{ext}`
+
+   If the collection uses **named partitions** (`client.create_partition(...)`, not a partition-key field), each segment is written under that partition’s name:  
+   `{output}/{db}/{collection}/{partition_name}/segment_{segment_id}.{ext}`
+
+   The built-in `_default` partition stays at the collection root. Partition-key shards (names like `_default_0`) are also left at the collection root so they are not treated as user-named partitions.
 
 Indexes are **not** extracted; index build artifacts are not stored under `binlogs/insert_log`.
+
+### Named partitions vs partition keys
+
+Milvus supports two different partition mechanisms:
+
+| Kind | How it is created | Extract output |
+|------|-------------------|----------------|
+| Named partition | `create_partition("c_1_50")` | `{collection}/c_1_50/segment_….jsonl` |
+| Default partition | Always present as `_default` | `{collection}/segment_….jsonl` |
+| Partition key | Schema field with `is_partition_key` (auto shards such as `_default_0`) | `{collection}/segment_….jsonl` (flat) |
+
+`list` prints named partitions and a `[partition_key]` flag on the relevant field so you can tell these apart before extracting.
+
+```bash
+# Collection with named partitions → one subdirectory per partition
+python milvus-backup-explorer.py extract --backup new_backup -c doyy --db write_test1 -o extracted
+```
+
+Example output tree:
+
+```
+extracted/write_test1/doyy/
+├── c_1_50/segment_….jsonl
+├── c_51_100/segment_….jsonl
+├── c_101_500/segment_….jsonl
+├── c_501_1000/segment_….jsonl
+└── c_10001/segment_….jsonl
+```
 
 ```bash
 # All collections → JSONL under extracted/
@@ -117,7 +153,7 @@ Extract row data from milvus-backup insert binlogs (not indexes).
 
 positional arguments:
   {list,extract}
-    list          List collections and fields from backup metadata
+    list          List collections, fields, and named partitions from backup metadata
     extract       Extract insert data to JSONL/JSON/CSV/Parquet
 
 options:
@@ -169,7 +205,7 @@ options:
 ```
 milvus-backup-explorer.py      # CLI entry point
 milvus_backup_explorer/
-  meta.py                      # Load meta/*.json, resolve binlog paths
+  meta.py                      # Load meta/*.json, partitions, resolve binlog paths
   binlog.py                    # Read Parquet column groups
   codec.py                     # Type decoding (vectors, sparse, geometry)
   extract.py                   # Segment merge and export

@@ -39,6 +39,7 @@ class FieldInfo:
     is_primary_key: bool = False
     type_params: dict[str, str] | None = None
     is_function_output: bool = False
+    is_partition_key: bool = False
 
     @property
     def dim(self) -> int | None:
@@ -58,6 +59,7 @@ class FieldInfo:
             is_primary_key=bool(raw.get("is_primary_key")),
             type_params=type_params or None,
             is_function_output=bool(raw.get("is_function_output")),
+            is_partition_key=bool(raw.get("is_partition_key")),
         )
 
 

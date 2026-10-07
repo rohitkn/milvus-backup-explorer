@@ -153,6 +153,19 @@ def _rows_to_arrow(rows: list[dict[str, Any]], field_order: list[str] | None) ->
     return pa.table(columns)
 
 
+def _segment_output_dir(
+    output_dir: Path,
+    collection: CollectionInfo,
+    catalog: BackupCatalog,
+    segment: SegmentInfo,
+) -> Path:
+    coll_dir = output_dir / collection.db_name / collection.collection_name
+    partition_name = catalog.partition_name(segment.collection_id, segment.partition_id)
+    if partition_name and catalog.is_named_partition(collection, partition_name):
+        return coll_dir / partition_name
+    return coll_dir
+
+
 def extract_backup(
     catalog: BackupCatalog,
     output_dir: Path,
@@ -174,13 +187,13 @@ def extract_backup(
             segments = _segments_from_disk(catalog, collection.collection_id)
 
         total_rows = 0
-        coll_dir = output_dir / collection.db_name / collection.collection_name
         for segment in segments:
             rows = extract_segment(catalog, collection, segment, options)
             if not rows:
                 continue
             ext = _format_extension(options.output_format)
-            out_file = coll_dir / f"segment_{segment.segment_id}{ext}"
+            seg_dir = _segment_output_dir(output_dir, collection, catalog, segment)
+            out_file = seg_dir / f"segment_{segment.segment_id}{ext}"
             field_order = [f.name for f in sorted(collection.fields.values(), key=lambda x: x.field_id)]
             write_rows(rows, out_file, options.output_format, field_order=field_order)
             total_rows += len(rows)
@@ -227,7 +240,7 @@ def iter_collection_rows(
         yield segment, extract_segment(catalog, collection, segment, options)
 
 
-def format_collection_summary(collection: CollectionInfo) -> str:
+def format_collection_summary(collection: CollectionInfo, catalog: BackupCatalog | None = None) -> str:
     fields = sorted(collection.fields.values(), key=lambda f: f.field_id)
     lines = [f"  fields ({len(fields)}):"]
     for f in fields:
@@ -236,6 +249,22 @@ def format_collection_summary(collection: CollectionInfo) -> str:
             flags.append("pk")
         if f.is_function_output:
             flags.append("function_output")
+        if f.is_partition_key:
+            flags.append("partition_key")
         flag_txt = f" [{', '.join(flags)}]" if flags else ""
         lines.append(f"    - {f.name} (id={f.field_id}, {field_type_label(f)}){flag_txt}")
+
+    if catalog is not None and not collection.has_partition_key:
+        named = [
+            p for p in catalog.partitions(collection.collection_id)
+            if catalog.is_named_partition(collection, p.partition_name)
+        ]
+        if named:
+            lines.append(f"  named partitions ({len(named)}):")
+            for part in named:
+                seg_count = len(
+                    [s for s in catalog.segments(collection_id=collection.collection_id) if s.partition_id == part.partition_id]
+                )
+                lines.append(f"    - {part.partition_name} (segments={seg_count})")
+
     return "\n".join(lines)

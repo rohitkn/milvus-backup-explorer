@@ -10,6 +10,9 @@ from typing import Any, Iterator
 from .schema import FieldInfo
 
 
+DEFAULT_PARTITION_NAME = "_default"
+
+
 @dataclass(frozen=True)
 class CollectionInfo:
     collection_id: int
@@ -21,6 +24,17 @@ class CollectionInfo:
     @property
     def qualified_name(self) -> str:
         return f"{self.db_name}.{self.collection_name}"
+
+    @property
+    def has_partition_key(self) -> bool:
+        return any(f.is_partition_key for f in self.fields.values())
+
+
+@dataclass(frozen=True)
+class PartitionInfo:
+    partition_id: int
+    partition_name: str
+    collection_id: int
 
 
 @dataclass(frozen=True)
@@ -40,6 +54,7 @@ class BackupCatalog:
         self.binlogs_dir = self.backup_dir / "binlogs"
         self._collections: dict[int, CollectionInfo] = {}
         self._segments: list[SegmentInfo] = []
+        self._partitions: dict[int, dict[int, PartitionInfo]] = {}
         self._backup_meta: dict[str, Any] = {}
         self._load()
 
@@ -56,14 +71,23 @@ class BackupCatalog:
                     int(f["fieldID"]): FieldInfo.from_schema_dict(f)
                     for f in raw.get("schema", {}).get("fields", [])
                 }
+                collection_id = int(raw["collection_id"])
                 coll = CollectionInfo(
-                    collection_id=int(raw["collection_id"]),
+                    collection_id=collection_id,
                     db_name=raw.get("db_name", "default"),
                     collection_name=raw["collection_name"],
                     fields=fields,
                     num_rows_hint=_sum_segment_rows(raw),
                 )
-                self._collections[coll.collection_id] = coll
+                self._collections[collection_id] = coll
+                for part in raw.get("partition_backups", []):
+                    self._register_partition(part)
+
+        part_path = self.meta_dir / "partition_meta.json"
+        if part_path.is_file():
+            payload = json.loads(part_path.read_text())
+            for raw in payload.get("infos", []):
+                self._register_partition(raw)
 
         seg_path = self.meta_dir / "segment_meta.json"
         if seg_path.is_file():
@@ -109,6 +133,33 @@ class BackupCatalog:
                 continue
             return coll
         return None
+
+    def _register_partition(self, raw: dict[str, Any]) -> None:
+        collection_id = int(raw["collection_id"])
+        partition_id = int(raw["partition_id"])
+        partition_name = raw.get("partition_name")
+        if not partition_name:
+            return
+        by_collection = self._partitions.setdefault(collection_id, {})
+        by_collection[partition_id] = PartitionInfo(
+            partition_id=partition_id,
+            partition_name=partition_name,
+            collection_id=collection_id,
+        )
+
+    def partitions(self, collection_id: int) -> list[PartitionInfo]:
+        parts = self._partitions.get(collection_id, {})
+        return sorted(parts.values(), key=lambda p: p.partition_name)
+
+    def partition_name(self, collection_id: int, partition_id: int) -> str | None:
+        part = self._partitions.get(collection_id, {}).get(partition_id)
+        return part.partition_name if part else None
+
+    def is_named_partition(self, collection: CollectionInfo, partition_name: str) -> bool:
+        """True for user-created partitions (create_partition), not partition-key shards."""
+        if collection.has_partition_key:
+            return False
+        return partition_name != DEFAULT_PARTITION_NAME
 
     def segments(
         self,
